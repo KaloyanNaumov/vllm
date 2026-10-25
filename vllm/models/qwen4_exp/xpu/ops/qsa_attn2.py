@@ -285,11 +285,15 @@ class _Launch(NamedTuple):
     tiles_per_prog: int = 1
 
 
-# The configs that compile with zero spill for BMG-G31 (Triton 3.8.0+xpu, IGC
-# 2.41.5).
-_DECODE = _Launch(block_n=32, num_dchunk=4, row_chunk=4096)
-_PREFILL = _Launch(block_n=64, num_dchunk=8, row_chunk=256)
-_GRF_MODE: dict[str, str] = {}
+# The fastest configs measured on a B70 (Triton 3.8.0+xpu, IGC 2.41.5,
+# compute-runtime 26.35): BLOCK_N 32 x 8 head_dim chunks at 256 GRF, zero spill,
+# for both regions. Decode 8 rows 54-56 us (32 rows 84-202, 64 rows 191-372, over
+# 4K-131K of context); prefill 4,096 rows 9.3 ms at 32K, 12.6 ms at 131K. At 128
+# GRF the same tile spills 192 B and runs ~17 % slower. Keep one subgroup: every
+# BLOCK_N 32 or 64 config with num_warps 2 crashes IGC 2.41.5 with a SIGFPE.
+_DECODE = _Launch(block_n=32, num_dchunk=8, row_chunk=4096)
+_PREFILL = _Launch(block_n=32, num_dchunk=8, row_chunk=512)
+_GRF_MODE = {"grf_mode": "256"}
 # Rows at/above which a use_prefill_config call takes the prefill region.
 _PREFILL_ROWS = 2048
 
