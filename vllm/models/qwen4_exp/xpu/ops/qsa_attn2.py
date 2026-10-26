@@ -320,6 +320,7 @@ def qsa_sparse_paged_attention_attn2(
     block_m: int,
 ) -> torch.Tensor:
     """Launch the kernels; ``qsa_sparse_paged_attention`` validated the inputs."""
+    logger.info_once("Qwen4Exp QSA sparse attention on XPU: the attn2 kernel.")
     head_dim = q.shape[2]
     num_kv_heads = k_cache.shape[2]
     group_size = q.shape[1] // num_kv_heads
