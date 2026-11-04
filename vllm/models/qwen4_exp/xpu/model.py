@@ -86,6 +86,10 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 
+# nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
+from ..nvidia import model as _nvidia_model  # noqa: F401
+from ..nvidia.qsa import Qwen4ExpQSAAttention
+
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3_VisionTransformer,
     Qwen3VLDummyInputsBuilder,
@@ -107,6 +111,20 @@ _FULL_ATTENTION_LAYER_TYPES = (
     "qwen_sparse_attention",
     "indexed_attention",
 )
+_QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
+
+
+def _uses_qsa(config: Qwen4ExpTextConfig) -> bool:
+    """Whether the indexed layers carry a QSA indexer (sparse attention)."""
+    return getattr(config, "indexer_n_heads", None) is not None
+
+
+def _skipped_weight_substrs(config: Qwen4ExpTextConfig) -> tuple[str, ...]:
+    # The PLE n-gram table is memory-mapped from a host-RAM file, not a param.
+    # Without QSA, the indexed layers run dense and the indexer is unused.
+    if _uses_qsa(config):
+        return (".ngram_embedding.",)
+    return (".ngram_embedding.", ".indexer.")
 
 
 class _WeightContainer(nn.Module):
@@ -513,6 +531,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 gqa_interleaved_layout=False,
                 reduce_results=True,
             )
+        elif self.layer_type in _QSA_LAYER_TYPES and _uses_qsa(config):
+            self.self_attn = Qwen4ExpQSAAttention(
+                vllm_config=vllm_config,
+                config=config,
+                layer_id=self.layer_idx,
+                quant_config=quant_config,
+                reduce_results=True,
+                prefix=f"{prefix}.self_attn",
+            )
         elif self.layer_type in _FULL_ATTENTION_LAYER_TYPES:
             self.self_attn = Qwen3NextAttention(
                 config,
@@ -789,7 +816,7 @@ class Qwen4ExpModel(Qwen3NextModel):
         # dense-attention fallback, so skip ``.indexer.`` too. Skip the whole
         # ``.ngram_embedding.`` submodule (shards + any fp8 ``weight_scale``)
         # since the table is always read from the mmap'd bf16 file.
-        _skip_substrs = (".ngram_embedding.", ".indexer.")
+        _skip_substrs = _skipped_weight_substrs(self.config)
         weights = ((n, w) for n, w in weights if not any(s in n for s in _skip_substrs))
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -962,7 +989,7 @@ class Qwen4ExpForCausalLM(
         # constants go to GPU params. Only the 102GB table shards are skipped
         # (they are memory-mapped from a host-RAM file, not params). The QSA
         # indexer is unused by the dense-attention fallback.
-        _skip_substrs = (".ngram_embedding.", ".indexer.")
+        _skip_substrs = _skipped_weight_substrs(self.config)
         weights = ((n, w) for n, w in weights if not any(s in n for s in _skip_substrs))
         loader = AutoWeightsLoader(
             self,
@@ -1151,7 +1178,7 @@ class Qwen4ExpForConditionalGeneration(
         # via the inherited Qwen3-VL weight mapper. Skip the MTP drafter head
         # (``mtp.*``) and the host-RAM PLE n-gram table shards + QSA indexer
         # (handled outside the param loader, like the text-only model).
-        _skip_substrs = (".ngram_embedding.", ".indexer.")
+        _skip_substrs = _skipped_weight_substrs(self.model_config.hf_text_config)
         weights = ((n, w) for n, w in weights if not any(s in n for s in _skip_substrs))
         loader = AutoWeightsLoader(
             self,

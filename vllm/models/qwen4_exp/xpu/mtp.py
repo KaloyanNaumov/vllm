@@ -155,7 +155,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.layers = torch.nn.ModuleList(
             Qwen4ExpDecoderLayer(
                 vllm_config,
-                layer_type="full_attention",
+                layer_type="qwen_sparse_attention",
                 prefix=f"{prefix}.layers.{idx}",
             )
             for idx in range(self.num_mtp_layers)
@@ -169,6 +169,25 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 ["hidden_states", "residual"], config.hidden_size
             )
         )
+
+    def _iter_qsa_attentions(self):
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if getattr(attention, "indexer", None) is not None:
+                yield attention
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Select on MTP step 0 and reuse its QSA indices on later steps."""
+        for attention in self._iter_qsa_attentions():
+            attention.indexer.skip_topk = skip
+
+    def compact_topk_indices(self, row_indices: torch.Tensor) -> None:
+        """Keep each request's target-aligned step-0 sparse-index row."""
+        num_rows = row_indices.numel()
+        for attention in self._iter_qsa_attentions():
+            buffer = attention.topk_indices_buffer
+            selected = buffer.index_select(0, row_indices)
+            buffer[:num_rows].copy_(selected)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
