@@ -727,6 +727,23 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
+    if current_platform.is_xpu():
+        from ...xpu.ops.qsa_attn2 import qsa_sparse_paged_attention_attn2
+
+        return qsa_sparse_paged_attention_attn2(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            output_gate_view,
+            softmax_scale,
+            output_scale,
+            block_m,
+        )
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
@@ -823,6 +840,15 @@ def warmup_qsa_sparse_paged_attention(
     selection_width: int,
 ) -> tuple[tuple[int, int, int], ...]:
     """Compile every production-reachable split-K/merge specialization."""
+    if current_platform.is_xpu():
+        from ...xpu.ops.qsa_attn2 import warmup_qsa_sparse_paged_attention_attn2
+
+        return warmup_qsa_sparse_paged_attention_attn2(
+            kv_cache,
+            block_table,
+            num_query_heads=num_query_heads,
+            selection_width=selection_width,
+        )
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     # An fp8 cache is allocated as uint8 storage; warm the dtype the impl hands
