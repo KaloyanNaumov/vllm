@@ -1127,6 +1127,8 @@ class Qwen4ExpForCausalLM(
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
+    requires_raw_input_tokens = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
@@ -1411,6 +1413,7 @@ class Qwen4ExpForConditionalGeneration(
     processor, and MRoPE wiring are reused verbatim.
     """
 
+    requires_raw_input_tokens = True
     supports_multimodal_pruning = True
     is_3d_moe_weight: bool = True
 
