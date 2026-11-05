@@ -11,8 +11,8 @@ full-attention + MoE) extended with:
   ``[T, n_embd]`` view and writes back through per-stream injection
   weights. The top-level ``hyper_connection_mixer`` acts as the final
   output norm (there is no separate RMSNorm).
-- **PLE** n-gram embedding table, served on host from the checkpoint shards
-  (see ``Qwen4ExpPLE``).
+- **PLE** n-gram embedding table, placed by ``--engram-config`` (see
+  ``Qwen4ExpPLE``).
 - **QSA** sparse attention on the indexed layers, via the CUDA
   ``Qwen4ExpQSAAttention`` when the config carries a QSA indexer
   (``indexer_n_heads``). Without one, those layers run dense.
@@ -106,6 +106,11 @@ from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
 from ..nvidia.model import get_qsa_topk_buffer_width
+from ..nvidia.ngram_embedding import (
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLEDiskOffloadEmbedding,
+    Qwen4ExpPLENvFp4EmbeddingMethod,
+)
 from ..nvidia.qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)
@@ -323,17 +328,24 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
     """Per-Layer Embedding (n-gram table) for Qwen4-Exp, layer 1 only.
 
     The n-gram table (320M rows: ~95 GiB in BF16, ~48 GiB in FP8) never
-    becomes a device param. The checkpoint's ``ngram_embedding.shard_*``
-    tensors (BF16, or FP8 with a global ``weight_scale``) are kept as the
-    loader's zero-copy mmap views of the checkpoint files, so the table lives
-    in the page cache (shared across TP ranks); rows are gathered on host and
-    only those move to the device.
+    becomes a device param. ``--engram-config`` places it:
 
-    ``Qwen4ExpModelState`` stages each step's rows before the forward (see
-    ``stage_ple_rows``): 16 row ids per token are hashed on device from the
-    step's tokens and the request's preceding tokens (``ngram_context``, rebuilt
-    every step from the token history), read back, gathered and copied to a
-    fixed device buffer. The forward only reads that buffer, so graphs replay it.
+    - Default (``cpu_offload`` and ``disk_offload`` off): the checkpoint's
+      ``ngram_embedding.shard_*`` tensors (BF16, or FP8 with a global
+      ``weight_scale``) are kept as the loader's zero-copy mmap views of the
+      checkpoint files, so the table lives in the page cache (shared across TP
+      ranks); rows are gathered on host and only those move to the device.
+    - ``cpu_offload``: the shared pinned table, each rank holding its share and
+      the forward reading it through UVA, as on ROCm. No host read.
+    - ``disk_offload``: the shared disk table, as on CUDA: rows are read from
+      the checkpoint files, without relying on the page cache staying warm.
+
+    ``Qwen4ExpModelState`` runs ``stage_ple_rows`` before the forward: 16 row
+    ids per token are hashed on device from the step's tokens and the request's
+    preceding tokens (``ngram_context``, rebuilt every step from the token
+    history). The two file-backed tables read them back and copy the rows to a
+    fixed device buffer. The forward only reads a fixed buffer, so graphs replay
+    it.
 
     The rest follows the CUDA/ROCm PLE layer and runs the shared kernels:
     key/value proj -> grouped
@@ -348,6 +360,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         config: Qwen4ExpTextConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        ple_dense_layer_id: int = 0,
     ):
         super().__init__()
         self.hc = config.hc_count
@@ -380,23 +393,62 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         self.norm_key = _WeightContainer([self.hc_dim])
         self.norm_query = _WeightContainer([self.hc_dim])
         self.norm_conv = _WeightContainer([self.hc_dim])
-        self.ple_embedding = PLEEmbedding(self.ngram, self.n_heads)
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        engram_config = vllm_config.engram_config
+        self.table_is_mapped = engram_config is None or not (
+            engram_config.cpu_offload or engram_config.disk_offload
+        )
+        self.ple_embedding: PLEEmbedding | Qwen4ExpNGramEmbedding
+        if self.table_is_mapped:
+            self.ple_embedding = PLEEmbedding(self.ngram, self.n_heads)
+            # Runs the post-load validation of the mapped table.
+            self.quant_method = _PLETableFinalizer()
+        else:
+            self.ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                ple_dense_layer_id,
+                max_tokens,
+                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+                prefix=f"{prefix}.ple_embedding",
+                quant_config=vllm_config.quant_config,
+                params_dtype=vllm_config.model_config.dtype,
+            )
+            method = self.ple_embedding.ngram_embedding.embedding_method
+            if isinstance(method, Qwen4ExpPLENvFp4EmbeddingMethod):
+                raise NotImplementedError(
+                    "NVFP4 Qwen4Exp PLE tables are not supported on XPU yet; use a "
+                    "checkpoint with a BF16 or FP8 PLE table."
+                )
+        self.table_on_disk = not self.table_is_mapped and isinstance(
+            self.ple_embedding.ngram_embedding, Qwen4ExpPLEDiskOffloadEmbedding
+        )
+        logger.info_once(
+            "XPU PLE table: %s (--engram-config %s).",
+            "in the mapped checkpoint files"
+            if self.table_is_mapped
+            else "read from the checkpoint files"
+            if self.table_on_disk
+            else "in pinned host memory, looked up through UVA",
+            str(engram_config),
+        )
 
         # Checkpoint n-gram table shards (collected at load time, validated by
         # the post-load hook). Dummy loads ship no shards; their lookups
         # return zeros.
-        self.quant_method = _PLETableFinalizer()
         self._dummy_load = vllm_config.load_config.load_format == "dummy"
         self._ckpt_shards: dict[int, torch.Tensor] = {}
         self._ckpt_scale: torch.Tensor | None = None
         self._ckpt_dtype: torch.dtype | None = None
         self._shard_starts: torch.Tensor | None = None
 
-        # Fixed per-step buffers. The host ones are written only after the
-        # step's stream sync, so after the previous step's copy has finished.
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        embed_dim = self.n_heads * self.head_dim
+        # Fixed per-step buffers: the row ids, and for the mapped table the rows.
+        # The host ones are written only after the step's stream sync, so after
+        # the previous step's copy has finished.
         self._row_ids = torch.zeros(max_tokens, self.n_heads, dtype=torch.int64)
+        if not self.table_is_mapped:
+            return
+        embed_dim = self.n_heads * self.head_dim
         self._staged_rows = torch.zeros(max_tokens, embed_dim, dtype=torch.bfloat16)
         pin = self._staged_rows.device.type == "xpu"
         self._host_ids = torch.empty(
@@ -530,6 +582,10 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
+    @property
+    def reads_rows_on_host(self) -> bool:
+        return self.table_is_mapped or self.table_on_disk
+
     def hash_rows(
         self,
         input_ids: torch.Tensor,
@@ -550,19 +606,34 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             heads_per_ngram=self.per_gram,
             output=self._row_ids[: input_ids.shape[0]],
         )
-        self._host_ids[: ids.shape[0]].copy_(ids, non_blocking=True)
+        if self.table_on_disk:
+            self.ple_embedding.ngram_embedding.copy_ids_to_host(ids)
+        elif self.table_is_mapped:
+            self._host_ids[: ids.shape[0]].copy_(ids, non_blocking=True)
 
     def stage_rows(self, num_tokens: int) -> None:
-        """Gather the rows of ``_host_ids`` and queue their copy to the device."""
+        """Read the step's rows on host and queue their copy to the device."""
+        if self.table_on_disk:
+            self.ple_embedding.ngram_embedding.stage_rows(num_tokens)
+            return
+        if not self.table_is_mapped:
+            return
         rows = self._gather_rows(self._host_ids[:num_tokens].reshape(-1))
         self._host_rows[:num_tokens].copy_(rows.reshape(num_tokens, -1))
         self._staged_rows[:num_tokens].copy_(
             self._host_rows[:num_tokens], non_blocking=True
         )
 
-    def lookup(self, num_tokens: int) -> torch.Tensor:
+    def lookup(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
         """This step's n-gram embeddings ``[T, n_heads * head_dim]`` on device."""
-        return self._staged_rows[:num_tokens]
+        if self.table_is_mapped:
+            return self._staged_rows[:num_tokens]
+        embedding = self.ple_embedding.ngram_embedding
+        if self.table_on_disk:
+            rows = embedding.staged_rows(num_tokens)
+        else:
+            rows = embedding.sync_lookup(self._row_ids[:num_tokens]).flatten(-2)
+        return embedding.dequantize(rows, dtype)
 
     def short_conv(
         self,
@@ -721,11 +792,14 @@ def stage_ple_rows(
     A host read cannot be captured in a graph, so it happens here. The ids hash
     this step's tokens, which the previous step samples on the device, and a
     non-blocking copy from an XPU device may still be running when it returns,
-    so the read has to wait for both.
+    so the read has to wait for both. A pinned table has no host read and no
+    sync: its lookup reads the hashed ids in queue order.
     """
     for layer in layers:
         layer.hash_rows(input_ids, query_start_loc, ngram_context)
-    if input_ids.device.type != "cpu":
+    if input_ids.device.type != "cpu" and any(
+        layer.reads_rows_on_host for layer in layers
+    ):
         with gpu_sync_allowed():
             torch.accelerator.synchronize()
     for layer in layers:
@@ -734,7 +808,7 @@ def stage_ple_rows(
 
 def qwen4_exp_xpu_ple_lookup(output: torch.Tensor, layer_name: str) -> None:
     # Keeps the table's rows out of the compiled graph's arguments.
-    output.copy_(_ple_layer(layer_name).lookup(output.shape[0]))
+    output.copy_(_ple_layer(layer_name).lookup(output.shape[0], output.dtype))
 
 
 @eager_break_during_capture
@@ -813,7 +887,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.ple = None
         ple_layer_indices = {v - 1 for v in config.ple_layer_ids}
         if self.layer_idx in ple_layer_indices:
-            self.ple = Qwen4ExpPLE(config, vllm_config, prefix=f"{prefix}.ple")
+            self.ple = Qwen4ExpPLE(
+                config,
+                vllm_config,
+                prefix=f"{prefix}.ple",
+                ple_dense_layer_id=sorted(set(config.ple_layer_ids)).index(
+                    self.layer_idx + 1
+                ),
+            )
 
         # Hyper-connections replace the per-layer RMSNorm + residual add.
         self.attn_hyper_connection = HyperConnection(config, has_inject=True)
@@ -1093,10 +1174,11 @@ class Qwen4ExpModel(Qwen3NextModel):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The PLE n-gram table is not a param: its shards (and FP8 scale) are
-        # handed to the owning Qwen4ExpPLE, which serves rows from them on
+        # A mapped PLE n-gram table is not a param: its shards (and FP8 scale)
+        # are handed to the owning Qwen4ExpPLE, which serves rows from them on
         # host and validates them in its post-load hook (this method can run
-        # several times, once per run of consecutive checkpoint names).
+        # several times, once per run of consecutive checkpoint names). The
+        # other tables load through their Qwen4ExpNGramEmbedding.
         # Indexer tensors of layers that run dense (no QSA indexer in the
         # config, or a layer type that is not indexed) are dropped and
         # reported.
@@ -1115,9 +1197,11 @@ class Qwen4ExpModel(Qwen3NextModel):
                 match = _PLE_TABLE_RE.fullmatch(name)
                 if match is not None:
                     ple = getattr(self.layers[int(match.group(1))], "ple", None)
-                    if ple is not None:
+                    if ple is None:
+                        continue
+                    if ple.table_is_mapped:
                         ple.accept_checkpoint_tensor(match.group(2), tensor)
-                    continue
+                        continue
                 yield name, tensor
 
         loader = AutoWeightsLoader(self)
