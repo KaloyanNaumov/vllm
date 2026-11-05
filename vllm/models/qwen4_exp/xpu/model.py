@@ -33,6 +33,7 @@ from transformers import (
     Qwen4ExpTextConfig,
 )
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -92,6 +93,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -327,10 +329,14 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
     in the page cache (shared across TP ranks); rows are gathered on host and
     only those move to the device.
 
+    ``Qwen4ExpModelState`` stages each step's rows before the forward (see
+    ``stage_ple_rows``): 16 row ids per token are hashed on device from the
+    step's tokens and the request's preceding tokens (``ngram_context``, rebuilt
+    every step from the token history), read back, gathered and copied to a
+    fixed device buffer. The forward only reads that buffer, so graphs replay it.
+
     The rest follows the CUDA/ROCm PLE layer and runs the shared kernels:
-    16 row ids per token are hashed on device from the step's tokens and the
-    request's preceding tokens (``ngram_context``, rebuilt every step from the
-    token history by ``Qwen4ExpModelState``); key/value proj -> grouped
+    key/value proj -> grouped
     RMSNorm gate -> dilated causal conv (kernel 4, dilation 3) -> added to the
     wide residual ``[T, hc, n_embd]``. The conv history is a vLLM-managed
     short-conv Mamba state, so prefix caching and spec-decode rollback cover
@@ -385,6 +391,20 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         self._ckpt_scale: torch.Tensor | None = None
         self._ckpt_dtype: torch.dtype | None = None
         self._shard_starts: torch.Tensor | None = None
+
+        # Fixed per-step buffers. The host ones are written only after the
+        # step's stream sync, so after the previous step's copy has finished.
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        embed_dim = self.n_heads * self.head_dim
+        self._row_ids = torch.zeros(max_tokens, self.n_heads, dtype=torch.int64)
+        self._staged_rows = torch.zeros(max_tokens, embed_dim, dtype=torch.bfloat16)
+        pin = self._staged_rows.device.type == "xpu"
+        self._host_ids = torch.empty(
+            max_tokens, self.n_heads, dtype=torch.int64, device="cpu", pin_memory=pin
+        )
+        self._host_rows = torch.empty(
+            max_tokens, embed_dim, dtype=torch.bfloat16, device="cpu", pin_memory=pin
+        )
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -510,20 +530,17 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
-    def lookup(
+    def hash_rows(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
-    ) -> torch.Tensor:
-        """N-gram embeddings ``[T, n_heads * head_dim]`` (BF16, on device).
-
-        Row ids are hashed on device, then the rows are gathered from the
-        host-side table and moved to the device.
-        """
+    ) -> None:
+        """Hash this step's row ids on device and queue their copy to host."""
         emb = self.ple_embedding
-        rows = ple_ngram_ids(
-            input_ids=input_ids.reshape(-1),
+        input_ids = input_ids.reshape(-1)
+        ids = ple_ngram_ids(
+            input_ids=input_ids,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             layer_multipliers=emb.layer_multipliers,
@@ -531,9 +548,21 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             ngram_heads_offsets=emb.ngram_heads_offsets,
             eos_token_id=self.eos,
             heads_per_ngram=self.per_gram,
+            output=self._row_ids[: input_ids.shape[0]],
         )
-        out = self._gather_rows(rows.reshape(-1).cpu())
-        return out.reshape(rows.shape[0], -1).to(input_ids.device)
+        self._host_ids[: ids.shape[0]].copy_(ids, non_blocking=True)
+
+    def stage_rows(self, num_tokens: int) -> None:
+        """Gather the rows of ``_host_ids`` and queue their copy to the device."""
+        rows = self._gather_rows(self._host_ids[:num_tokens].reshape(-1))
+        self._host_rows[:num_tokens].copy_(rows.reshape(num_tokens, -1))
+        self._staged_rows[:num_tokens].copy_(
+            self._host_rows[:num_tokens], non_blocking=True
+        )
+
+    def lookup(self, num_tokens: int) -> torch.Tensor:
+        """This step's n-gram embeddings ``[T, n_heads * head_dim]`` on device."""
+        return self._staged_rows[:num_tokens]
 
     def short_conv(
         self,
@@ -650,22 +679,14 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             **conv,
         )
 
-    def forward(
-        self,
-        residual: torch.Tensor,
-        input_ids: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        ngram_context: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, residual: torch.Tensor) -> torch.Tensor:
         # residual: [T, hc, n_embd] (wide state). Returns the updated wide state.
         T = residual.shape[0]
         hidden = residual.reshape(T, self.hc_dim).contiguous()
         emb = torch.empty(
             T, self.n_heads * self.head_dim, dtype=hidden.dtype, device=hidden.device
         )
-        torch.ops.vllm.qwen4_exp_xpu_ple_lookup(
-            input_ids, query_start_loc, ngram_context, emb, self.prefix
-        )
+        torch.ops.vllm.qwen4_exp_xpu_ple_lookup(emb, self.prefix)
         key = emb @ self.key_proj.weight.t()  # [T, hc_dim]
         value = emb @ self.value_proj.weight.t()  # [T, n_embd]
         gated, conv_input = torch.ops.vllm.qwen4_exp_xpu_ple_gate(
@@ -689,18 +710,34 @@ def _ple_layer(layer_name: str) -> Qwen4ExpPLE:
     return layer
 
 
-def qwen4_exp_xpu_ple_lookup(
+def stage_ple_rows(
+    layers: list[Qwen4ExpPLE],
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
     ngram_context: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
 ) -> None:
-    # Host-side table gather: keep it out of the compiled graph.
-    layer = _ple_layer(layer_name)
-    output.copy_(layer.lookup(input_ids, query_start_loc, ngram_context))
+    """Stage one step's PLE rows behind one stream sync, before the forward.
+
+    A host read cannot be captured in a graph, so it happens here. The ids hash
+    this step's tokens, which the previous step samples on the device, and a
+    non-blocking copy from an XPU device may still be running when it returns,
+    so the read has to wait for both.
+    """
+    for layer in layers:
+        layer.hash_rows(input_ids, query_start_loc, ngram_context)
+    if input_ids.device.type != "cpu":
+        with gpu_sync_allowed():
+            torch.accelerator.synchronize()
+    for layer in layers:
+        layer.stage_rows(input_ids.numel())
 
 
+def qwen4_exp_xpu_ple_lookup(output: torch.Tensor, layer_name: str) -> None:
+    # Keeps the table's rows out of the compiled graph's arguments.
+    output.copy_(_ple_layer(layer_name).lookup(output.shape[0]))
+
+
+@eager_break_during_capture
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
@@ -827,9 +864,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor = None,
-        input_ids: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        ngram_context: torch.Tensor | None = None,
         **kwargs: object,
     ):
         # hidden_states: [T, n_embd] (only consumed when residual is None)
@@ -840,9 +874,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         # PLE (n-gram table) at the configured layer, before the attention mix.
         if self.ple is not None:
-            if input_ids is None or query_start_loc is None or ngram_context is None:
-                raise RuntimeError("PLE inputs were not prepared")
-            residual = self.ple(residual, input_ids, query_start_loc, ngram_context)
+            residual = self.ple(residual)
 
         # Attention sub-block.
         cur, inject = self.attn_hyper_connection.mix(residual)
@@ -915,8 +947,6 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
-        "query_start_loc": 0,
-        "ngram_context": 0,
     }
 )
 class Qwen4ExpModel(Qwen3NextModel):
@@ -1027,11 +1057,7 @@ class Qwen4ExpModel(Qwen3NextModel):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        ngram_context: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        # query_start_loc / ngram_context: per-request PLE n-gram inputs from
-        # Qwen4ExpModelState.
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1048,9 +1074,6 @@ class Qwen4ExpModel(Qwen3NextModel):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_ids=input_ids,
-                query_start_loc=query_start_loc,
-                ngram_context=ngram_context,
             )
 
         if not get_pp_group().is_last_rank:
@@ -1188,8 +1211,6 @@ class Qwen4ExpForCausalLM(
             positions,
             intermediate_tensors,
             inputs_embeds,
-            query_start_loc=kwargs.get("query_start_loc"),
-            ngram_context=kwargs.get("ngram_context"),
         )
         return hidden_states
 
@@ -1504,8 +1525,6 @@ class Qwen4ExpForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
-            query_start_loc=kwargs.get("query_start_loc"),
-            ngram_context=kwargs.get("ngram_context"),
         )
         return hidden_states
 
