@@ -33,6 +33,7 @@ from transformers import (
     Qwen4ExpTextConfig,
 )
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -689,6 +690,7 @@ def _ple_layer(layer_name: str) -> Qwen4ExpPLE:
     return layer
 
 
+@eager_break_during_capture
 def qwen4_exp_xpu_ple_lookup(
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -701,6 +703,7 @@ def qwen4_exp_xpu_ple_lookup(
     output.copy_(layer.lookup(input_ids, query_start_loc, ngram_context))
 
 
+@eager_break_during_capture
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
