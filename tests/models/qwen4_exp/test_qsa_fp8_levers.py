@@ -11,7 +11,11 @@ from torch import nn
 
 from vllm.config import CacheConfig
 from vllm.config.speculative import SpeculativeConfig
-from vllm.models.qwen4_exp.common.qsa_indexer import qsa_kv_cache_dtype
+from vllm.models.qwen4_exp.common.qsa_indexer import (
+    QSACompressedKeyCache,
+    QSARawKeyCache,
+    qsa_kv_cache_dtype,
+)
 from vllm.models.qwen4_exp.nvidia import (
     model as _qwen4_exp_model,  # noqa: F401  (import order: model before qsa)
 )
@@ -122,3 +126,35 @@ def test_warmup_covers_a_draft_with_its_own_dtype(
     warmup.qwen4_exp_qsa_triton_warmup(worker)
     want = ["table1"] + (["table2"] if len(warmed) == 2 else [])
     assert calls == want
+
+
+# --------------------------------------------------------------------------
+# A draft's cache config is a copy from before the block size resolves
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("draft_dtype", ["bfloat16", "auto"])
+def test_draft_qsa_caches_use_the_resolved_block_size(draft_dtype: str) -> None:
+    resolved = 1600
+    built_with = CacheConfig(block_size=64, cache_dtype=draft_dtype)
+    live = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=resolved),
+        num_speculative_tokens=3,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    compressed = QSACompressedKeyCache(
+        head_size=128,
+        dtype=torch.bfloat16,
+        cache_config=built_with,
+        prefix="mtp.layers.0.self_attn.indexer.compressed_key_cache",
+        vllm_config=live,
+        compress_ratio=4,
+    )
+    raw = QSARawKeyCache(
+        head_size=140,
+        dtype=torch.bfloat16,
+        cache_config=built_with,
+        prefix="mtp.layers.0.self_attn.indexer.raw_key_cache",
+        vllm_config=live,
+        compress_ratio=4,
+    )
+    assert compressed.get_kv_cache_spec(live).block_size == resolved
+    assert raw.get_kv_cache_spec(live).block_size == 8
