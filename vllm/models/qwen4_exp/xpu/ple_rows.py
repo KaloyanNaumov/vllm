@@ -438,6 +438,18 @@ class RowReader:
             else None
         )
         self._pread_batch: Callable[..., None] = _compiled()[0]
+        # Numba compiles on the first call: have it here, not in a step.
+        self._pread_batch(
+            self._extent_fds,
+            self._extent_offsets,
+            self._extent_offsets,
+            self._bounce_addr,
+            READ_SLOT,
+            0,
+            0,
+            self._results,
+            self._latencies_ns,
+        )
         self._preadv = os.preadv  # tests swap this to inject faults
         self.retries = 0
 
@@ -568,6 +580,8 @@ class RowCache:
         self.step = 0
         self._alloc_out = np.empty(1024, dtype=np.int64)
         self._clock_alloc = _compiled()[1]
+        # Numba compiles on the first call: have it here, not in a step.
+        self._clock_alloc(0, 0, self.ref, self.epoch, -1, 0, self._alloc_out)
 
     def begin_step(self) -> None:
         self.step += 1
