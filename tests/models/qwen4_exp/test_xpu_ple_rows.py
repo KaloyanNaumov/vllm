@@ -271,6 +271,33 @@ def test_server_uses_prefetched_rows_before_reading(table_file, monkeypatch):
     assert server.cache.row2slot[20] >= 0
 
 
+def test_wrong_lookahead_rows_give_way_to_the_next_step(table_file):
+    """At the minimum capacity, two steps of two rows, rows from a wrong
+    lookahead guess must not take the next step's room."""
+    path, offset, _ = table_file
+    server = _server(path, offset, capacity=4)
+    wrong = np.array([2, 3])
+    server.resolve(np.array([[0], [1]]), prefetched=(wrong, _row_bytes(wrong)))
+    assert (server.cache.row2slot[wrong] >= 0).all()
+    own = np.array([[4], [5]])
+    slots, mask = server.resolve(own)
+    assert np.array_equal(server.cache.slab[slots[mask]], _row_bytes(own[mask]))
+    # The previous step's rows stay protected; the guesses gave way.
+    assert (server.cache.row2slot[[0, 1]] >= 0).all()
+    assert (server.cache.row2slot[wrong] == -1).all()
+
+
+def test_a_lookahead_row_is_protected_once_a_step_asks_for_it(table_file):
+    path, offset, _ = table_file
+    server = _server(path, offset, capacity=4)
+    guess = np.array([2, 3])
+    server.resolve(np.array([[0], [1]]), prefetched=(guess, _row_bytes(guess)))
+    server.resolve(np.array([[2], [3]]))  # right guess: hits, now protected
+    server.resolve(np.array([[4], [5]]))
+    assert (server.cache.row2slot[guess] >= 0).all()
+    assert (server.cache.row2slot[[0, 1]] == -1).all()
+
+
 def test_lookahead_plan_continues_each_prefill_within_the_budget():
     idx = np.array([7, 9, 4])
     computed = np.array([0, 100, 50])

@@ -562,7 +562,8 @@ class RowCache:
     Eviction is CLOCK with epoch protection: a slot touched in this step or the
     previous one is never evicted. A step that needs more slots than that leaves
     raises before any map changes; the table refuses a capacity below two full
-    steps at boot.
+    steps at boot. Speculative rows are not protected until a lookup touches
+    them, so lookahead never uses up those two steps.
     """
 
     def __init__(self, num_rows: int, slab: np.ndarray) -> None:
@@ -613,8 +614,15 @@ class RowCache:
             )
         return out[:count].copy()
 
-    def install(self, local_rows: np.ndarray, data: np.ndarray) -> None:
-        """Place unique missing ``local_rows`` into freshly allocated slots."""
+    def install(
+        self, local_rows: np.ndarray, data: np.ndarray, speculative: bool = False
+    ) -> None:
+        """Place unique missing ``local_rows`` into freshly allocated slots.
+
+        ``speculative`` rows (a lookahead guess no lookup has asked for) stay
+        evictable until a lookup touches them, so they never take the room the
+        two-step protection keeps for rows a step actually needs.
+        """
         slots = self._allocate(local_rows.shape[0])
         evicted = self.slot2row[slots]
         evicted = evicted[evicted >= 0]
@@ -623,6 +631,9 @@ class RowCache:
         self.slab[slots] = data
         self.slot2row[slots] = local_rows
         self.row2slot[local_rows] = slots.astype(np.int32)
+        if speculative:
+            self.epoch[slots] = _EPOCH_FREE
+            self.ref[slots] = 0
 
 
 # --------------------------------------------------------------------------
@@ -839,7 +850,8 @@ class RowServer:
         nothing below can evict it. Misses come from ``prefetched`` (sorted unique
         local rows and their bytes) where present and from the file otherwise, and
         are installed together. Prefetched rows this step did not need go in last,
-        best effort, so they only displace rows older than the previous step.
+        best effort, so they only displace rows older than the previous step, and
+        stay evictable until a later lookup asks for them.
         """
         started = time.perf_counter()
         self.cache.begin_step()
@@ -897,7 +909,7 @@ class RowServer:
         if not absent.any():
             return
         try:
-            self.cache.install(rows[absent], data[absent])
+            self.cache.install(rows[absent], data[absent], speculative=True)
         except RuntimeError:
             logger.debug(
                 "PLE row cache had no room for %d prefetched rows", absent.sum()
