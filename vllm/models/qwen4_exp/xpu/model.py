@@ -984,17 +984,18 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         # Custom intermediate-tensors factory: the residual is the wide
         # hyper-connection state [T, hc, n_embd].
-        def _make_empty_intermediate_tensors(num_tokens, dtype, device):
+        # The runners pass the size as ``batch_size=`` (models/utils.py).
+        def _make_empty_intermediate_tensors(batch_size, dtype, device):
             return IntermediateTensors(
                 {
                     "hidden_states": torch.empty(
-                        num_tokens,
+                        batch_size,
                         config.hidden_size,
                         dtype=dtype,
                         device=device,
                     ),
                     "residual": torch.empty(
-                        num_tokens,
+                        batch_size,
                         config.hc_count,
                         config.hidden_size,
                         dtype=dtype,
