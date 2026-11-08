@@ -880,22 +880,24 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for layer in self.model.layers:
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
-                moe = layer.mlp
-                moe.n_local_physical_experts = num_local_physical_experts
-                moe.n_physical_experts = num_physical_experts
-                moe.n_redundant_experts = self.num_redundant_experts
-                moe.experts.update_expert_map()
+        # Walk the MoE blocks collected at init: under PP, the layers of other
+        # stages are PPMissingLayer and have no ``mlp``.
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def set_moe_parameters(self):
         self.moe_layers = []
+        self.moe_mlp_layers: list[Qwen3NextSparseMoeBlock] = []
         example_moe = None
         for layer in self.model.layers:
             if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
                 layer.mlp, Qwen3NextSparseMoeBlock
             ):
                 example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
 
         if example_moe is None:
@@ -944,10 +946,19 @@ class Qwen4ExpModel(Qwen3NextModel):
         self.hc = config.hc_count
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        # Only the first PP stage embeds tokens; the last one also keeps the
+        # table when the LM head is tied to it.
+        pp_group = get_pp_group()
+        self.embed_tokens: VocabParallelEmbedding | PPMissingLayer
+        if pp_group.is_first_rank or (
+            config.tie_word_embeddings and pp_group.is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # One top-k buffer shared by all QSA layers. It lives on the model, not in a
         # local, so a draft model can share it.
@@ -1376,22 +1387,24 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for layer in self.language_model.model.layers:
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
-                moe = layer.mlp
-                moe.n_local_physical_experts = num_local_physical_experts
-                moe.n_physical_experts = num_physical_experts
-                moe.n_redundant_experts = self.num_redundant_experts
-                moe.experts.update_expert_map()
+        # Walk the MoE blocks collected at init: under PP, the layers of other
+        # stages are PPMissingLayer and have no ``mlp``.
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def set_moe_parameters(self):
         self.moe_layers = []
+        self.moe_mlp_layers: list[Qwen3NextSparseMoeBlock] = []
         example_moe = None
         for layer in self.language_model.model.layers:
             if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
                 layer.mlp, Qwen3NextSparseMoeBlock
             ):
                 example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
 
         if example_moe is None:
