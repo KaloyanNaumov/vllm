@@ -6,7 +6,9 @@ With ``mm_device_do_normalize`` on (the default) the processor leaves the
 pixels raw and the tower's input norm rescales and normalises them on the
 device. The tower is replaced by a stand-in here, so the tests cover what the
 model decides: which input norm the tower is built with, and that the norm
-turns raw pixels into what the processor would have produced.
+turns raw pixels into what the processor would have produced. The last tests
+cover what the wrapper builds around the tower: no tower in text-only mode, and
+a refusal for a checkpoint with deepstack layers.
 """
 
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch import nn
+
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fusion import mm_input_norm
 from vllm.model_executor.layers.fusion.mm_input_norm import (
@@ -23,6 +26,8 @@ from vllm.model_executor.layers.fusion.mm_input_norm import (
     IdentityInputNorm,
     NormParams,
 )
+from vllm.model_executor.models.interfaces import has_inner_state
+from vllm.model_executor.models.utils import StageMissingLayer
 from vllm.models.qwen4_exp.xpu import model as xpu_model
 
 # Qwen3-VL image processor values.
@@ -60,10 +65,16 @@ def _config() -> VllmConfig:
     return VllmConfig(device_config=DeviceConfig(device="cpu"))
 
 
-def _build(do_normalize: bool) -> Any:
+def _build(
+    do_normalize: bool = True,
+    language_model_only: bool = False,
+    deepstack: list[int] | None = None,
+) -> Any:
     """Run the XPU wrapper's __init__ with the tower and text model stubbed."""
     config = SimpleNamespace(
-        vision_config=SimpleNamespace(deepstack_visual_indexes=[], out_hidden_size=8),
+        vision_config=SimpleNamespace(
+            deepstack_visual_indexes=deepstack or [], out_hidden_size=8
+        ),
         rms_norm_eps=1e-6,
     )
     model_config = SimpleNamespace(
@@ -71,7 +82,9 @@ def _build(do_normalize: bool) -> Any:
         model="stub",
         revision=None,
         multimodal_config=SimpleNamespace(
-            mm_encoder_tp_mode="weights", mm_device_do_normalize=do_normalize
+            mm_encoder_tp_mode="weights",
+            mm_device_do_normalize=do_normalize,
+            language_model_only=language_model_only,
         ),
     )
     vllm_config = SimpleNamespace(model_config=model_config, quant_config=None)
@@ -118,3 +131,43 @@ def test_raw_pixels_match_processor_normalised_pixels(dtype: torch.dtype) -> Non
     )
     # Raw 0..255 pixels reaching the tower unchanged is the bug.
     assert tower_input.float().abs().max() <= 1.0 + 1e-2
+
+
+def test_language_model_only_builds_no_tower() -> None:
+    model = _build(language_model_only=True)
+    assert isinstance(model.visual, StageMissingLayer)
+    assert model._tower_model_names == []
+    assert not any(isinstance(m, _Tower) for m in model.modules())
+
+
+def _loaded_names(model: Any) -> set[str]:
+    class _Loader:
+        def __init__(self, *_args: object, **_kwargs: object) -> None: ...
+
+        def load_weights(self, weights, mapper):
+            return {name for name, _ in mapper.apply(weights)}
+
+    names = [
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.language_model.layers.0.mlp.gate.weight",
+    ]
+    with patch.object(xpu_model, "AutoWeightsLoader", _Loader):
+        return model.load_weights((name, torch.zeros(1)) for name in names)
+
+
+def test_language_model_only_drops_the_tower_weights() -> None:
+    assert _loaded_names(_build(language_model_only=True)) == {
+        "language_model.model.layers.0.mlp.gate.weight"
+    }
+    assert "visual.blocks.0.attn.qkv.weight" in _loaded_names(_build())
+
+
+def test_deepstack_checkpoint_is_refused_with_the_tower() -> None:
+    with pytest.raises(NotImplementedError, match="deepstack"):
+        _build(deepstack=[3, 7])
+    model = _build(language_model_only=True, deepstack=[3, 7])
+    assert not model.use_deepstack
+
+
+def test_vl_wrapper_declares_inner_state() -> None:
+    assert has_inner_state(xpu_model.Qwen4ExpForConditionalGeneration)
