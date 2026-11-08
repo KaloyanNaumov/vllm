@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests of the XPU Qwen4Exp PLE tables: the kernels are replaced by torch."""
 
+import gc
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -17,6 +18,7 @@ from transformers import Qwen4ExpTextConfig
 from vllm.config import VllmConfig
 from vllm.config.engram import EngramConfig
 from vllm.config.model import ModelConfig
+from vllm.config.parallel import ParallelConfig
 from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
 from vllm.models.qwen4_exp.xpu import model as xpu_model
@@ -373,3 +375,53 @@ def test_model_state_stages_rows_and_passes_no_ple_inputs() -> None:
     assert states is req_states
     assert query_start_loc.tolist() == [0, 2, 3]
     assert ngram_context is context
+
+
+def _disk_table(monkeypatch, tmp_path: Path) -> DiskRowTable:
+    folder = _save_checkpoint(tmp_path / "ckpt", torch.bfloat16)
+    ple = _make_ple(monkeypatch, _engram("bf16", folder, disk_offload=True), "bf16")
+    _load(ple, folder)
+    table = ple.row_table
+    assert isinstance(table, DiskRowTable)
+    return table
+
+
+def test_disk_table_close_stops_the_lookahead_and_the_readers(
+    monkeypatch, tmp_path
+) -> None:
+    table = _disk_table(monkeypatch, tmp_path)
+    lookahead = table._lookahead
+    assert lookahead is not None and lookahead._thread.is_alive()
+    readers = [table._server.reader, lookahead.reader]
+    assert all(reader._fds for reader in readers)
+    table.close()
+    assert not lookahead._thread.is_alive()
+    assert not any(reader._fds for reader in readers)
+    table.close()
+
+
+def test_disk_table_closes_when_collected(monkeypatch, tmp_path) -> None:
+    table = _disk_table(monkeypatch, tmp_path)
+    lookahead = table._lookahead
+    assert lookahead is not None
+    thread = lookahead._thread
+    del table
+    gc.collect()
+    assert not thread.is_alive()
+
+
+def test_pinned_table_needs_uva(monkeypatch, tmp_path) -> None:
+    folder = _save_checkpoint(tmp_path / "ckpt", torch.bfloat16)
+    ple = _make_ple(monkeypatch, _engram("bf16", folder, cpu_offload=True), "bf16")
+    monkeypatch.setattr(ple_table, "is_uva_available", lambda: False)
+    with pytest.raises(RuntimeError, match="UVA"):
+        _load(ple, folder)
+
+
+@pytest.mark.parametrize(("xpu", "shared"), [(True, False), (False, True)])
+def test_dp_shared_memory_defaults_off_on_xpu(monkeypatch, xpu, shared) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: xpu)
+    config = EngramConfig(cpu_offload=True)
+    parallel = SimpleNamespace(data_parallel_size=2, enable_elastic_ep=False)
+    config.resolve_dp_shared_memory(cast(ParallelConfig, parallel))
+    assert config.dp_shared_memory is shared

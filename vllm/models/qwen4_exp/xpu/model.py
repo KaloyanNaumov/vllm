@@ -164,17 +164,11 @@ def _is_file_backed(tensor: torch.Tensor) -> bool | None:
     safetensors hands out zero-copy mmap views whose storage reports no
     filename, so look the data pointer up in ``/proc/self/maps`` instead.
     """
-    ptr = tensor.data_ptr()
     try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                fields = line.split()
-                lo, hi = (int(x, 16) for x in fields[0].split("-"))
-                if lo <= ptr < hi:
-                    return len(fields) > 5 and fields[5].startswith("/")
+        path, _ = _maps_entry(tensor.data_ptr())
     except OSError:
         return None
-    return False
+    return path.startswith("/")
 
 
 def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
@@ -382,7 +376,6 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         config: Qwen4ExpTextConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
-        ple_dense_layer_id: int = 0,
     ):
         super().__init__()
         self.hc = config.hc_count
@@ -1063,14 +1056,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.ple = None
         ple_layer_indices = {v - 1 for v in config.ple_layer_ids}
         if self.layer_idx in ple_layer_indices:
-            self.ple = Qwen4ExpPLE(
-                config,
-                vllm_config,
-                prefix=f"{prefix}.ple",
-                ple_dense_layer_id=sorted(set(config.ple_layer_ids)).index(
-                    self.layer_idx + 1
-                ),
-            )
+            self.ple = Qwen4ExpPLE(config, vllm_config, prefix=f"{prefix}.ple")
 
         # Hyper-connections replace the per-layer RMSNorm + residual add.
         self.attn_hyper_connection = HyperConnection(config, has_inject=True)

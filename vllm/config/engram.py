@@ -75,7 +75,8 @@ class EngramConfig:
     by FABRIC handle where supported, else /dev/shm (which then needs capacity
     and a shared IPC namespace). Defaults to enabled whenever the other settings
     allow it, falling back to per-replica tables when DP replicas are not
-    co-located on one node or the host cannot hold them."""
+    co-located on one node or the host cannot hold them. Off by default on XPU,
+    where the Qwen4Exp PLE tables are per replica."""
 
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
@@ -145,12 +146,16 @@ class EngramConfig:
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
+        from vllm.platforms import current_platform
+
         if self.dp_shared_memory is None:
+            # The XPU Qwen4Exp PLE tables keep one copy per DP replica.
             self.dp_shared_memory = (
                 self.cpu_offload
                 and not self.use_thp
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
+                and not current_platform.is_xpu()
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:

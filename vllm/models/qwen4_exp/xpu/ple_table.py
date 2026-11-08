@@ -16,6 +16,7 @@ cache filled before the forward with direct reads.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Sequence
 from typing import Any
 
@@ -26,6 +27,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from .ple_int8 import decode_rows
@@ -235,6 +237,12 @@ class PinnedRowTable(_RowTable):
         heads: int,
         device: torch.device,
     ) -> None:
+        if not is_uva_available():
+            raise RuntimeError(
+                "The XPU PLE table in pinned host memory (cpu_offload) is read "
+                "through UVA, which is unavailable here; use disk_offload or the "
+                "mapped default instead"
+            )
         super().__init__(row_format, rank_range, max_tokens, heads, device)
         self._tensors: list[torch.Tensor] = []
 
@@ -340,6 +348,12 @@ class DiskRowTable(_RowTable):
                 RowReader(extents, row_bytes, threads=threads),
                 max_rows=max_tokens * max(1, self.own_heads.shape[0]),
             )
+        # The readers hold file descriptors and a thread pool, and the lookahead
+        # a thread. Release them when the table is collected (the runner drops
+        # the model at shutdown) or at exit, unless close() ran first.
+        self._finalizer = weakref.finalize(
+            self, _close_disk_table, reader, self._lookahead
+        )
         logger.info(
             "XPU PLE rows on disk (rank %d): %s rows [%d, %d), %d B/row, %s, "
             "row cache %d rows (%.2f GiB pinned), %d read threads, lookahead %s",
@@ -354,6 +368,10 @@ class DiskRowTable(_RowTable):
             threads,
             "on" if self._lookahead is not None else "off",
         )
+
+    def close(self) -> None:
+        """Stop the lookahead thread and close the readers. Idempotent."""
+        self._finalizer()
 
     def stage(
         self,
@@ -435,6 +453,13 @@ class DiskRowTable(_RowTable):
             np.asarray(starts, dtype=np.int64),
             np.asarray(context, dtype=np.int64),
         )
+
+
+def _close_disk_table(reader: RowReader, lookahead: RowLookahead | None) -> None:
+    # Holds no reference to the table, so the table can be collected.
+    if lookahead is not None:
+        lookahead.close()
+    reader.close()
 
 
 def build_row_table(
