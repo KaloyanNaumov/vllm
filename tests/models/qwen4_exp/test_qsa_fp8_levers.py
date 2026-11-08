@@ -19,9 +19,11 @@ from vllm.models.qwen4_exp.common.qsa_indexer import (
 from vllm.models.qwen4_exp.nvidia import (
     model as _qwen4_exp_model,  # noqa: F401  (import order: model before qsa)
 )
+from vllm.models.qwen4_exp.nvidia import qsa as qsa_module
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 from vllm.models.qwen4_exp.nvidia.qsa_indexer import QSAIndexer
+from vllm.models.qwen4_exp.xpu import model as xpu_model
 from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
 HD = 256
@@ -158,3 +160,75 @@ def test_draft_qsa_caches_use_the_resolved_block_size(draft_dtype: str) -> None:
     )
     assert compressed.get_kv_cache_spec(live).block_size == resolved
     assert raw.get_kv_cache_spec(live).block_size == 8
+
+
+# --------------------------------------------------------------------------
+# The unfused QSA cache write takes a plain dtype string as "auto"
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("cache_dtype", "op_dtype"),
+    [("bfloat16", "auto"), ("auto", "auto"), ("fp8_e4m3", "fp8_e4m3")],
+)
+def test_qsa_cache_write_passes_the_op_a_dtype_it_knows(
+    monkeypatch: pytest.MonkeyPatch, cache_dtype: str, op_dtype: str
+) -> None:
+    impl = object.__new__(qsa_module.Qwen4ExpQSAImpl)
+    impl.head_size = 8
+    impl.kv_cache_dtype = cache_dtype
+    calls: list[str] = []
+    monkeypatch.setattr(
+        qsa_module.ops,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(args[5]),
+    )
+    key = torch.zeros(2, 1, 8, dtype=torch.bfloat16)
+    kv_cache = torch.zeros(4, 1, 1, 16, dtype=torch.bfloat16)
+    layer = SimpleNamespace(_k_scale=torch.ones(1), _v_scale=torch.ones(1))
+    impl.do_kv_cache_update(layer, key, key.clone(), kv_cache, torch.tensor([0, 1]))
+    assert calls == [op_dtype]
+
+
+# --------------------------------------------------------------------------
+# The XPU loader: serialized KV scales of QSA layers
+# --------------------------------------------------------------------------
+class _QSALayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = object.__new__(Qwen4ExpQSAAttention)
+        nn.Module.__init__(self.self_attn)
+
+
+def test_xpu_loader_moves_qsa_kv_scales_onto_the_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = object.__new__(xpu_model.Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([nn.Identity(), _QSALayer()])
+    model.config = SimpleNamespace()
+    model.max_model_len = 16
+    seen: dict[str, object] = {}
+
+    class _Loader:
+        def __init__(self, _module: nn.Module, **kwargs: object) -> None:
+            seen["kwargs"] = kwargs
+
+        def load_weights(self, weights, mapper):
+            seen["names"] = [name for name, _ in weights]
+            return set()
+
+    monkeypatch.setattr(xpu_model, "AutoWeightsLoader", _Loader)
+    names = [
+        "layers.1.self_attn.k_proj.k_scale",
+        "layers.1.self_attn.attn.v_scale",
+        "layers.0.self_attn.attn.k_scale",
+        "layers.1.self_attn.qkv_proj.weight",
+    ]
+    model.load_weights((name, torch.ones(1)) for name in names)
+    assert seen["names"] == [
+        "layers.1.self_attn._k_scale",
+        "layers.1.self_attn._v_scale",
+        "layers.0.self_attn.attn.k_scale",
+        "layers.1.self_attn.qkv_proj.weight",
+    ]
+    suffixes = seen["kwargs"]["ignore_unexpected_suffixes"]  # type: ignore[index]
+    assert ".k_scale" in suffixes and "_input_scale" in suffixes
