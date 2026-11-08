@@ -22,6 +22,7 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 """
 
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from itertools import islice
 from typing import ClassVar
 
@@ -41,8 +42,16 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.abstract import (
+    MambaBase,
+    get_mamba_prefill_checkpoint_alignment,
+    get_mamba_prefill_checkpoint_grid,
+)
+from vllm.model_executor.layers.mamba.checkpoint import (
+    MambaPrefillCheckpointExporter,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -100,7 +109,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
@@ -375,6 +384,9 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         self.dil = self.ngram
         self.hist = (self.kern - 1) * self.dil
         self.eos = int(config.eos_token_id)
+        # The conv window ending at a prefill checkpoint is a copy of its last
+        # inputs.
+        self._checkpoint_exporter = MambaPrefillCheckpointExporter(state_len=self.hist)
 
         self.prefix = prefix
         self.model_config = vllm_config.model_config
@@ -386,9 +398,17 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # BF16 weights (unquantized in the checkpoints, like HC).
-        self.key_proj = _WeightContainer([self.hc_dim, self.n_embd])
-        self.value_proj = _WeightContainer([self.n_embd, self.n_embd])
+        # BF16 weights (unquantized in the checkpoints, like HC). The key and
+        # value projections read the same rows, so they run as one GEMM.
+        self.kv_proj = MergedColumnParallelLinear(
+            config.ple_embed_dim,
+            [self.hc_dim, self.n_embd],
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.kv_proj",
+            return_bias=False,
+            disable_tp=True,
+        )
         self.conv1d = _WeightContainer([self.hc_dim, 1, self.kern])
         self.norm_key = _WeightContainer([self.hc_dim])
         self.norm_query = _WeightContainer([self.hc_dim])
@@ -480,6 +500,26 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             intermediate_size=self.hc_dim,
             conv_kernel=self.hist + 1,
             num_spec=self.num_spec_tokens,
+        )
+
+    def get_prefill_checkpoint_alignment(self) -> int | None:
+        return 1 if self.cache_config.mamba_cache_mode == "align" else None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        # The scheduler takes internal checkpoints only when every Mamba layer
+        # can export them.
+        if (
+            self.get_prefill_checkpoint_alignment() is None
+            or get_mamba_prefill_checkpoint_alignment(vllm_config) is None
+            or not isinstance(spec, MambaSpec)
+        ):
+            return spec
+        grid = get_mamba_prefill_checkpoint_grid(vllm_config)
+        # Offsets are multiples of the grid, so the window holds only inputs.
+        assert grid >= self.hist
+        return replace(
+            spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=grid
         )
 
     def accept_checkpoint_tensor(self, name: str, tensor: torch.Tensor) -> None:
@@ -749,6 +789,15 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             token_indices=tokens_p,
             **conv,
         )
+        if metadata.checkpoint is not None:
+            assert metadata.non_spec_query_start_loc is not None
+            self._checkpoint_exporter.export(
+                metadata.checkpoint,
+                raw_qkv=inputs,
+                conv_state=conv_state,
+                cu_seqlens=metadata.non_spec_query_start_loc,
+                token_indices=non_spec_token_indices,
+            )
 
     def forward(self, residual: torch.Tensor) -> torch.Tensor:
         # residual: [T, hc, n_embd] (wide state). Returns the updated wide state.
@@ -758,8 +807,8 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             T, self.n_heads * self.head_dim, dtype=hidden.dtype, device=hidden.device
         )
         torch.ops.vllm.qwen4_exp_xpu_ple_lookup(emb, self.prefix)
-        key = emb @ self.key_proj.weight.t()  # [T, hc_dim]
-        value = emb @ self.value_proj.weight.t()  # [T, n_embd]
+        # key [T, hc_dim], value [T, n_embd]
+        key, value = self.kv_proj(emb).split([self.hc_dim, self.n_embd], dim=-1)
         gated, conv_input = torch.ops.vllm.qwen4_exp_xpu_ple_gate(
             key,
             value,
@@ -1039,6 +1088,9 @@ class Qwen4ExpModel(Qwen3NextModel):
             ".in_proj_z": (".in_proj_qkvz", 3),
             ".in_proj_b": (".in_proj_ba", 0),
             ".in_proj_a": (".in_proj_ba", 1),
+            # One GEMM for the PLE key and value projections.
+            "ple.key_proj": ("ple.kv_proj", 0),
+            "ple.value_proj": ("ple.kv_proj", 1),
         }
     )
 
@@ -1238,6 +1290,7 @@ class Qwen4ExpForCausalLM(
             "v_proj",
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "kv_proj": ["key_proj", "value_proj"],
         # GDN fused projections (separate in the checkpoint).
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
@@ -1532,6 +1585,7 @@ class Qwen4ExpForConditionalGeneration(
     is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
+        "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }

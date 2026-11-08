@@ -20,6 +20,8 @@ import vllm.models.qwen4_exp.nvidia.ngram_embedding as nvidia_embedding_module
 from vllm.config import VllmConfig
 from vllm.config.engram import EngramConfig
 from vllm.config.model import ModelConfig
+from vllm.model_executor import parameter
+from vllm.model_executor.layers import linear
 from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
@@ -39,6 +41,14 @@ NUM_ROWS, ROW_DIM, NUM_HEADS = 24, 32, 2
 ROW_IDS = torch.tensor([[0, 13], [5, 23], [6, 6]], dtype=torch.int64)
 TABLE = torch.linspace(-2, 2, NUM_ROWS * ROW_DIM).reshape(NUM_ROWS, ROW_DIM)
 FP8_SCALE = 0.25
+
+
+@pytest.fixture(autouse=True)
+def _no_tp(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The PLE key/value projection is a replicated linear layer.
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
 
 
 def _expected_rows(fmt: str) -> torch.Tensor:
