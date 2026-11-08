@@ -282,6 +282,8 @@ class _Launch(NamedTuple):
     block_n: int
     num_dchunk: int
     row_chunk: int
+    # Selection tiles one program walks. The kernels and the interpreter tests
+    # cover more than one; the B70 configs below use one per program.
     tiles_per_prog: int = 1
 
 
