@@ -19,8 +19,9 @@ Qwen3Next MTP):
 
 All MTP weights live under the ``mtp.`` prefix. They follow the checkpoint's
 quantization config like the target: in the FP8 checkpoint only the MTP routed
-experts are FP8, the rest stays BF16. The MTP layer's QSA indexer is ignored
-(attention runs dense on XPU). The speculative decoding framework replaces the
+experts are FP8, the rest stays BF16. The MTP layer is sparse (QSA) when the
+target is, and dense otherwise. The fc projections stay BF16: the draft has no
+quant config of its own here. The speculative decoding framework replaces the
 draft's token embedding and LM head with the target's after loading.
 
 The target model exposes the wide residual via ``get_mtp_target_hidden_states``
@@ -42,9 +43,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
 from vllm.models.qwen4_exp.xpu.model import (
@@ -156,8 +157,19 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # Top-level hyper-connection mixer acts as the final output norm.
         self.hyper_connection_mixer = HyperConnection(config, has_inject=False)
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        """PP carries the wide state: ``residual`` is ``[T, hc, n_embd]``."""
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.empty(
+                    batch_size, self.n_embd, dtype=dtype, device=device
+                ),
+                "residual": torch.empty(
+                    batch_size, self.hc, self.n_embd, dtype=dtype, device=device
+                ),
+            }
         )
 
     def _iter_qsa_attentions(self):
@@ -202,15 +214,19 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
-        if get_pp_group().is_first_rank:
+        # Branch on the inputs, not the rank: the drafter is built entirely on
+        # the last PP stage, where `is_first_rank` is False.
+        if intermediate_tensors is None:
+            assert hidden_states is not None
             if inputs_embeds is None:
+                assert input_ids is not None
                 inputs_embeds = self.embed_input_ids(input_ids)
             # hidden_states arrives flat [T, hc * n_embd]; reshape to wide.
             # Use the existing dim-0 symbol (shape[0]) rather than -1 so the
@@ -229,7 +245,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             # Not consumed by the layer when ``residual`` is not None.
             x = residual.mean(dim=1)
         else:
-            assert intermediate_tensors is not None
             x = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
@@ -290,7 +305,7 @@ class HyperConnectionRMSNorm(nn.Module):
         return xn * gamma
 
 
-class Qwen4ExpMTP(nn.Module, Qwen4ExpMixtureOfExperts):
+class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     """MTP draft wrapper: predictor + LM head.
 
     MTP-specific params live under the ``mtp.`` prefix and follow the
@@ -315,6 +330,9 @@ class Qwen4ExpMTP(nn.Module, Qwen4ExpMixtureOfExperts):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
         self.set_moe_parameters()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -324,15 +342,20 @@ class Qwen4ExpMTP(nn.Module, Qwen4ExpMixtureOfExperts):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
         **kwargs: object,
-    ):
-        hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        return self.model(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
-        return hidden_states
 
     def compute_logits(
         self,
@@ -342,8 +365,8 @@ class Qwen4ExpMTP(nn.Module, Qwen4ExpMixtureOfExperts):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The drafter receives the *full* checkpoint stream (all 48 main
-        # layers + the vision tower). Keep only what the draft model owns:
+        # The drafter receives the *full* checkpoint stream (every main layer
+        # and the vision tower). Keep only what the draft model owns:
         #   * ``mtp.*`` -> remapped to ``model.*`` (the predictor)
         #   * shared ``embed_tokens`` (strip the VL-wrapper prefix)
         #   * shared ``lm_head``

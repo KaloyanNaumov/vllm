@@ -16,7 +16,9 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm.config import VllmConfig
+from vllm.model_executor.models.interfaces import supports_pp
 from vllm.models.qwen4_exp.xpu import mtp as xpu_mtp
+from vllm.sequence import IntermediateTensors
 
 MAX_TOKENS = 8
 INDEXER_BUDGET, COMPRESS_RATIO = 12, 4
@@ -258,3 +260,115 @@ def test_compact_topk_indices_keeps_selected_rows_in_order() -> None:
         assert torch.equal(new[:3], old[rows])
         # Rows past the compacted prefix are untouched.
         assert torch.equal(new[3:], old[3:])
+
+
+HC, HIDDEN = 2, 4
+# With fused hyper-connections the decoder layer returns the wide state and a
+# pending combine; before them, the collapsed and the wide state.
+FUSED_HC = hasattr(xpu_mtp.HyperConnection, "combine_and_mix")
+
+
+class _RecordingLayer(nn.Module):
+    """Passes the wide state through and records what it was given."""
+
+    def __init__(self, index: int, seen: list[tuple[int, tuple[int, ...]]]) -> None:
+        super().__init__()
+        self.index = index
+        self.seen = seen
+
+    def forward(self, hidden_states, residual, positions):
+        self.seen.append((self.index, tuple(residual.shape)))
+        if FUSED_HC:
+            return residual, residual.mean(dim=1), None
+        return residual.mean(dim=1), residual
+
+    @property
+    def mlp_hyper_connection(self):
+        return SimpleNamespace(combine=lambda residual, block, injection: residual)
+
+
+class _Mixer:
+    def mix(self, wide):
+        return wide.mean(dim=1), None
+
+    def combine_and_mix(self, wide, block_output, injection):
+        return wide, wide.mean(dim=1), None
+
+
+def _pp_predictor(
+    monkeypatch: pytest.MonkeyPatch, *, first: bool, last: bool, num_layers: int
+) -> tuple[xpu_mtp.Qwen4ExpMultiTokenPredictor, list[tuple[int, tuple[int, ...]]]]:
+    predictor = object.__new__(xpu_mtp.Qwen4ExpMultiTokenPredictor)
+    nn.Module.__init__(predictor)
+    predictor.hc, predictor.n_embd = HC, HIDDEN
+    predictor.num_mtp_layers = num_layers
+    seen: list[tuple[int, tuple[int, ...]]] = []
+    predictor.layers = nn.ModuleList(
+        _RecordingLayer(i, seen) for i in range(num_layers)
+    )
+    predictor.embed_tokens = nn.Embedding(8, HIDDEN)
+    predictor.hyper_connection_mixer = _Mixer()
+    monkeypatch.setattr(predictor, "_fc_stage", lambda embeds, wide: wide + 1)
+    monkeypatch.setattr(
+        xpu_mtp,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=first, is_last_rank=last),
+    )
+    return predictor, seen
+
+
+def test_drafter_on_the_last_pp_stage_runs_its_fc_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Under PP the whole drafter sits on the last stage, which is not the first.
+    predictor, seen = _pp_predictor(monkeypatch, first=False, last=True, num_layers=1)
+    hidden = torch.randn(3, HC * HIDDEN)
+    out, wide = predictor(torch.tensor([1, 2, 3]), torch.arange(3), hidden)
+    assert seen == [(0, (3, HC, HIDDEN))]
+    torch.testing.assert_close(wide, hidden + 1)
+    assert out.shape == (3, HIDDEN)
+
+
+def test_intermediate_tensors_carry_the_wide_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predictor, seen = _pp_predictor(monkeypatch, first=False, last=False, num_layers=1)
+    empty = predictor.make_empty_intermediate_tensors(
+        3, torch.float32, torch.device("cpu")
+    )
+    assert empty["hidden_states"].shape == (3, HIDDEN)
+    assert empty["residual"].shape == (3, HC, HIDDEN)
+    sent = predictor(
+        None,
+        torch.arange(3),
+        torch.randn(3, HC * HIDDEN),
+        intermediate_tensors=IntermediateTensors(
+            {
+                "hidden_states": empty["hidden_states"].normal_(),
+                "residual": empty["residual"].normal_(),
+            }
+        ),
+    )
+    assert isinstance(sent, IntermediateTensors)
+    assert sent["residual"].shape == empty["residual"].shape
+    assert sent["hidden_states"].shape == empty["hidden_states"].shape
+    assert seen == [(0, (3, HC, HIDDEN))]
+
+
+def test_each_draft_step_runs_its_own_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    predictor, seen = _pp_predictor(monkeypatch, first=True, last=True, num_layers=2)
+    mtp = object.__new__(xpu_mtp.Qwen4ExpMTP)
+    nn.Module.__init__(mtp)
+    mtp.model = predictor
+    for step in range(3):
+        mtp(
+            torch.tensor([1, 2]),
+            torch.arange(2),
+            torch.randn(2, HC * HIDDEN),
+            spec_step_idx=step,
+        )
+    assert [index for index, _ in seen] == [0, 1, 0]
+
+
+def test_mtp_declares_pipeline_parallel_support() -> None:
+    assert supports_pp(xpu_mtp.Qwen4ExpMTP)
